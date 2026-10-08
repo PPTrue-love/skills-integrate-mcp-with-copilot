@@ -5,19 +5,86 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
+import hashlib
+import hmac
+import json
 import os
 from pathlib import Path
 
+from fastapi import Depends, FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import RedirectResponse
+from starlette.middleware.sessions import SessionMiddleware
+
+current_dir = Path(__file__).parent
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=os.getenv("SESSION_SECRET", "dev-only-change-this-before-deployment"),
+    same_site="lax",
+    https_only=os.getenv("SESSION_HTTPS_ONLY", "false").lower() == "true",
+)
 
 # Mount the static files directory
-current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+TEACHERS_FILE = Path(os.getenv("TEACHERS_FILE", current_dir / "teachers.json"))
+PASSWORD_HASH_ITERATIONS = 310_000
+
+
+class TeacherCredentials(BaseModel):
+    username: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=1, max_length=1024)
+
+
+def verify_teacher_credentials(username: str, password: str) -> bool:
+    try:
+        teachers_data = json.loads(TEACHERS_FILE.read_text(encoding="utf-8"))
+        teacher = teachers_data.get("teachers", {}).get(username)
+        if not isinstance(teacher, dict):
+            return False
+        salt = bytes.fromhex(teacher["salt"])
+        expected_hash = bytes.fromhex(teacher["password_hash"])
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return False
+
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, PASSWORD_HASH_ITERATIONS
+    )
+    return hmac.compare_digest(password_hash, expected_hash)
+
+
+def require_teacher(request: Request) -> str:
+    username = request.session.get("teacher")
+    if not isinstance(username, str) or not username:
+        raise HTTPException(status_code=401, detail="Teacher login required")
+    return username
+
+
+@app.post("/admin/login")
+def teacher_login(credentials: TeacherCredentials, request: Request):
+    if not verify_teacher_credentials(credentials.username, credentials.password):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    request.session.clear()
+    request.session["teacher"] = credentials.username
+    return {"username": credentials.username}
+
+
+@app.get("/admin/session")
+def get_teacher_session(request: Request):
+    username = request.session.get("teacher")
+    if not isinstance(username, str) or not username:
+        return {"authenticated": False}
+    return {"authenticated": True, "username": username}
+
+
+@app.post("/admin/logout")
+def teacher_logout(request: Request):
+    request.session.clear()
+    return {"message": "Logged out"}
 
 # In-memory activity database
 activities = {
@@ -89,7 +156,7 @@ def get_activities():
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, _: str = Depends(require_teacher)):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -111,7 +178,7 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, _: str = Depends(require_teacher)):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:

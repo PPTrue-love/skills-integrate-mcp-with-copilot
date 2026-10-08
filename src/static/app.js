@@ -2,18 +2,25 @@ document.addEventListener("DOMContentLoaded", () => {
   const activitiesList = document.getElementById("activities-list");
   const activitySelect = document.getElementById("activity");
   const signupForm = document.getElementById("signup-form");
+  const signupContainer = document.getElementById("signup-container");
   const messageDiv = document.getElementById("message");
+  const teacherAccountButton = document.getElementById("teacher-account-button");
+  const teacherLoginDialog = document.getElementById("teacher-login-dialog");
+  const teacherLoginForm = document.getElementById("teacher-login-form");
+  const teacherLoginMessage = document.getElementById("teacher-login-message");
+  let teacherAuthenticated = false;
 
-  // Function to fetch activities from API
   async function fetchActivities() {
     try {
       const response = await fetch("/activities");
+      if (!response.ok) {
+        throw new Error("Unable to load activities");
+      }
       const activities = await response.json();
 
-      // Clear loading message
       activitiesList.innerHTML = "";
+      activitySelect.replaceChildren(new Option("-- Select an activity --", ""));
 
-      // Populate activities list
       Object.entries(activities).forEach(([name, details]) => {
         const activityCard = document.createElement("div");
         activityCard.className = "activity-card";
@@ -21,7 +28,6 @@ document.addEventListener("DOMContentLoaded", () => {
         const spotsLeft =
           details.max_participants - details.participants.length;
 
-        // Create participants HTML with delete icons instead of bullet points
         const participantsHTML =
           details.participants.length > 0
             ? `<div class="participants-section">
@@ -29,8 +35,12 @@ document.addEventListener("DOMContentLoaded", () => {
               <ul class="participants-list">
                 ${details.participants
                   .map(
-                    (email) =>
-                      `<li><span class="participant-email">${email}</span><button class="delete-btn" data-activity="${name}" data-email="${email}">❌</button></li>`
+                    (email) => `<li>
+                      <span class="participant-email">${email}</span>
+                      ${teacherAuthenticated
+                        ? `<button class="delete-btn" data-activity="${name}" data-email="${email}" aria-label="Unregister ${email}">Remove</button>`
+                        : ""}
+                    </li>`
                   )
                   .join("")}
               </ul>
@@ -49,14 +59,12 @@ document.addEventListener("DOMContentLoaded", () => {
 
         activitiesList.appendChild(activityCard);
 
-        // Add option to select dropdown
         const option = document.createElement("option");
         option.value = name;
         option.textContent = name;
         activitySelect.appendChild(option);
       });
 
-      // Add event listeners to delete buttons
       document.querySelectorAll(".delete-btn").forEach((button) => {
         button.addEventListener("click", handleUnregister);
       });
@@ -69,7 +77,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // Handle unregister functionality
   async function handleUnregister(event) {
-    const button = event.target;
+    const button = event.target.closest(".delete-btn");
+    if (!button || !teacherAuthenticated) {
+      return;
+    }
     const activity = button.getAttribute("data-activity");
     const email = button.getAttribute("data-email");
 
@@ -89,16 +100,19 @@ document.addEventListener("DOMContentLoaded", () => {
         messageDiv.textContent = result.message;
         messageDiv.className = "success";
 
-        // Refresh activities list to show updated participants
-        fetchActivities();
+        await fetchActivities();
       } else {
+        if (response.status === 401) {
+          teacherAuthenticated = false;
+          updateTeacherControls();
+          await fetchActivities();
+        }
         messageDiv.textContent = result.detail || "An error occurred";
         messageDiv.className = "error";
       }
 
       messageDiv.classList.remove("hidden");
 
-      // Hide message after 5 seconds
       setTimeout(() => {
         messageDiv.classList.add("hidden");
       }, 5000);
@@ -113,6 +127,9 @@ document.addEventListener("DOMContentLoaded", () => {
   // Handle form submission
   signupForm.addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (!teacherAuthenticated) {
+      return;
+    }
 
     const email = document.getElementById("email").value;
     const activity = document.getElementById("activity").value;
@@ -134,16 +151,19 @@ document.addEventListener("DOMContentLoaded", () => {
         messageDiv.className = "success";
         signupForm.reset();
 
-        // Refresh activities list to show updated participants
-        fetchActivities();
+        await fetchActivities();
       } else {
+        if (response.status === 401) {
+          teacherAuthenticated = false;
+          updateTeacherControls();
+          await fetchActivities();
+        }
         messageDiv.textContent = result.detail || "An error occurred";
         messageDiv.className = "error";
       }
 
       messageDiv.classList.remove("hidden");
 
-      // Hide message after 5 seconds
       setTimeout(() => {
         messageDiv.classList.add("hidden");
       }, 5000);
@@ -155,6 +175,85 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  // Initialize app
-  fetchActivities();
+  function updateTeacherControls() {
+    signupContainer.classList.toggle("hidden", !teacherAuthenticated);
+    teacherAccountButton.textContent = teacherAuthenticated ? "Teacher sign out" : "Teacher sign in";
+  }
+
+  async function refreshTeacherSession() {
+    const response = await fetch("/admin/session");
+    if (!response.ok) {
+      throw new Error("Unable to check teacher session");
+    }
+    const session = await response.json();
+    teacherAuthenticated = session.authenticated === true;
+    updateTeacherControls();
+  }
+
+  teacherAccountButton.addEventListener("click", async () => {
+    if (!teacherAuthenticated) {
+      teacherLoginMessage.textContent = "";
+      teacherLoginMessage.classList.add("hidden");
+      teacherLoginDialog.showModal();
+      return;
+    }
+
+    try {
+      await fetch("/admin/logout", { method: "POST" });
+      teacherAuthenticated = false;
+      updateTeacherControls();
+      await fetchActivities();
+    } catch (error) {
+      console.error("Error signing out:", error);
+    }
+  });
+
+  document.getElementById("teacher-login-cancel").addEventListener("click", () => {
+    teacherLoginDialog.close();
+  });
+
+  teacherLoginForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const formData = new FormData(teacherLoginForm);
+    try {
+      const response = await fetch("/admin/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: formData.get("username"),
+          password: formData.get("password"),
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        teacherLoginMessage.textContent = result.detail || "Unable to sign in";
+        teacherLoginMessage.classList.remove("hidden");
+        return;
+      }
+
+      teacherLoginForm.reset();
+      teacherLoginDialog.close();
+      teacherAuthenticated = true;
+      updateTeacherControls();
+      await fetchActivities();
+    } catch (error) {
+      teacherLoginMessage.textContent = "Unable to sign in. Please try again.";
+      teacherLoginMessage.classList.remove("hidden");
+      console.error("Error signing in:", error);
+    }
+  });
+
+  async function initializeApp() {
+    try {
+      await refreshTeacherSession();
+    } catch (error) {
+      teacherAuthenticated = false;
+      updateTeacherControls();
+      console.error("Error checking teacher session:", error);
+    }
+    await fetchActivities();
+  }
+
+  updateTeacherControls();
+  initializeApp();
 });
